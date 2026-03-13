@@ -1,0 +1,6 @@
+.idea/
+/OutputFile/
+/venv/
+build/
+__pycache__/
+TempParam/

@@ -4,6 +4,8 @@ import torch
 import torch.nn as nn
 from torch.cuda.amp import autocast
 import torch.nn.functional as F
+import numpy as np
+from gesture_file.model import CNN3DBackbone
 
 # ---------- Model Definitions ----------
 class AngleNet(nn.Module):
@@ -84,6 +86,27 @@ class DistNet(nn.Module):
 
 # ---------- Inference Server ----------
 
+def infer_gesture(seq, gesture_model, prototypes, proto_labels, thr_gesture, device):
+    """
+    seq: (T, 2, 32, 32)
+    return: raw_label (0/1)
+    """
+    x = torch.from_numpy(seq.astype('float32')).permute(1, 0, 2, 3).unsqueeze(0).to(device)
+    # (T,2,H,W) -> (1,2,T,H,W)
+
+    with torch.no_grad(), autocast():
+        z = gesture_model(x)                 # (1, D)
+        dist = torch.cdist(z, prototypes)    # (1, K)
+        d_min, k = torch.min(dist, dim=1)
+        d_min_val = float(d_min.item())
+        c_hat = int(proto_labels[int(k.item())])
+
+        raw_label = 0
+        if c_hat == 1 and d_min_val < thr_gesture:
+            raw_label = 1
+
+    return raw_label
+
 def main():
     # ZeroMQ REP socket
     ctx  = zmq.Context()
@@ -102,40 +125,74 @@ def main():
     angle_model.load_state_dict(torch.load(r'C:\Users\mc2\Desktop\degree_trainer\model_list\angle_model\2025-09-02_14-06-50\angle_model_seq.pth', map_location=device))
     dist_model .load_state_dict(torch.load(r'C:\Users\mc2\Desktop\degree_trainer\model_list\dist_model\2025-09-02_14-10-40\dist_model_seq.pth',  map_location=device))
 
+    #gesture load
+    gesture_model = CNN3DBackbone(in_channels=2, emb_dim=32).to(device)
+    gesture_state = torch.load(r'gesture_file\model_last.pth', map_location=device)
+    gesture_model.load_state_dict(gesture_state, strict=True)
+    gesture_model.eval()
+
+    proto_npz = np.load(r'gesture_file\prototypes_last.npz')
+    prototypes = torch.tensor(proto_npz["prototypes"], dtype=torch.float32).to(device)
+
+    K = prototypes.shape[0]
+    proto_labels = [1][:K]
+    if "gesture_classes" in proto_npz:
+        gc = list(np.array(proto_npz["gesture_classes"]).tolist())
+        if len(gc) == K:
+            proto_labels = gc
+        elif len(gc) == K - 1:
+            proto_labels = [0] + gc
+
+    thr_gesture = 0.7
+
     angle_model.eval()
     dist_model.eval()
 
     while True:
         try:
-            # Expect a tuple: (mode, seq)
             mode, seq = pickle.loads(sock.recv())
-            # seq shape: (T, C, H, W), C=2 for angle, C=1 or 2 for distance in 'both'
-            x = torch.from_numpy(seq.astype('float32')).unsqueeze(0).to(device)  # (1, T, C, H, W)
 
-            angle, dist = None, None
+            angle, dist, gesture = None, None, None
 
             # Angle inference
             if mode in ('both', 'angle'):
+                x = torch.from_numpy(seq.astype('float32')).unsqueeze(0).to(device)
                 with torch.no_grad(), autocast():
                     angle = angle_model(x).item()
 
             # Distance inference
             if mode in ('both', 'dist'):
-                # If 'both', extract channel 0
+                x = torch.from_numpy(seq.astype('float32')).unsqueeze(0).to(device)
                 if mode == 'both':
                     x_dist = x[:, :, 0:1, :, :].contiguous()
                 else:
-                    # For 'dist' mode, seq should already have C=1
                     x_dist = x
                 with torch.no_grad(), autocast():
                     dist = dist_model(x_dist).item()
 
-            # Reply with (angle, dist)
-            sock.send_pyobj((angle, dist))
+            # Gesture inference
+            if mode == 'gesture':
+                gesture = infer_gesture(
+                    seq=seq,
+                    gesture_model=gesture_model,
+                    prototypes=prototypes,
+                    proto_labels=proto_labels,
+                    thr_gesture=thr_gesture,
+                    device=device
+                )
+
+            # reply
+            if mode == 'gesture':
+                sock.send_pyobj(gesture)
+            else:
+                sock.send_pyobj((angle, dist))
 
         except Exception as e:
             print(f"[Inference Error] {e}")
-            sock.send_pyobj((None, None))
+            if mode == 'gesture':
+                sock.send_pyobj(0)
+            else:
+                sock.send_pyobj((None, None))
 
 if __name__ == '__main__':
     main()
